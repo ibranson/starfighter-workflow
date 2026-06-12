@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Repair Workflow</title>
+  </head>
+  <body>
+    <!--
+      Placeholder served before `make web` builds the real SvelteKit bundle
+      into this directory. The Go binary embeds whatever is here at compile
+      time, so this file must exist for the build to succeed. `make web` /
+      the deploy script overwrite this with the real bundle; the build
+      artifacts alongside it (_app/) are gitignored.
+    -->
+    <main style="font-family: system-ui; max-width: 40rem; margin: 4rem auto; padding: 0 1rem">
+      <h1>Repair Workflow</h1>
+      <p>The SPA bundle has not been built yet. Run <code>make web</code> (or
+        <code>npm run build</code> in <code>web/</code>) to replace this placeholder.</p>
+      <p>The JSON API is live at <code>/api/v1/…</code> — e.g.
+        <code>GET /healthz</code>, <code>GET /api/v1/status</code>.</p>
+    </main>
+  </body>
+</html>

@@ -1,0 +1,41 @@
+[Unit]
+Description=Starfighter repair-workflow daemon (sfworkflowd)
+Documentation=https://github.com/starfighters/starfighter-workflow
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/sfworkflowd -config /etc/sfworkflowd/config.json
+Restart=on-failure
+RestartSec=2
+
+# This daemon owns no console and needs no hardware access — so unlike the
+# A/V daemon it can (and should) run unprivileged. DynamicUser spins up a
+# transient system user per start; StateDirectory gives it an owned, durable
+# /var/lib/sfworkflowd that survives restarts and reinstalls. This is the
+# crux of coexisting cleanly with the A/V app: separate user, separate state,
+# separate port — zero shared surface.
+DynamicUser=yes
+StateDirectory=sfworkflowd
+StateDirectoryMode=0750
+ConfigurationDirectory=sfworkflowd
+
+# Logs go to the journal (stderr AND stdout — no tty to fight over here).
+StandardOutput=journal
+StandardError=journal
+
+# Hardening for a plain network service.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+
+[Install]
+WantedBy=multi-user.target

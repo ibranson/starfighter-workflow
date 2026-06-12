@@ -1,0 +1,15 @@
+# Build artifacts
+/bin/
+internal/web/dist/*
+!internal/web/dist/index.html
+
+# Frontend
+web/node_modules/
+web/build/
+web/.svelte-kit/
+
+# Local state / scratch
+*.db
+*.db-wal
+*.db-shm
+*.local

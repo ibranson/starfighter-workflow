@@ -1,0 +1,21 @@
+# Normalize line endings. Shell scripts and unit files run on the Pi (Linux)
+# and MUST use LF — CRLF makes bash choke with "\r: command not found" and
+# systemd reject the unit. Force LF regardless of the dev's autocrlf setting.
+*.sh            text eol=lf
+*.service       text eol=lf
+Makefile        text eol=lf
+
+# Let Git normalize everything else to LF in the repo; PowerShell scripts are
+# fine either way but keeping the tree LF-clean avoids churn.
+*.go            text eol=lf
+*.ts            text eol=lf
+*.js            text eol=lf
+*.svelte        text eol=lf
+*.css           text eol=lf
+*.html          text eol=lf
+*.json          text eol=lf
+*.sql           text eol=lf
+*.md            text eol=lf
+
+# Binary assets — never touch.
+*.png           binary

@@ -1,0 +1,78 @@
+:root {
+  --bg: #0f1115;
+  --panel: #181b22;
+  --panel-2: #1f232c;
+  --border: #2a2f3a;
+  --text: #e7e9ee;
+  --muted: #9aa1ad;
+  --accent: #4f9dff;
+  --danger: #ff5c5c;
+  --ok: #45c98a;
+  --warn: #f0b545;
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  line-height: 1.45;
+}
+
+a { color: var(--accent); }
+
+button {
+  font: inherit;
+  cursor: pointer;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  color: var(--text);
+  padding: 0.4rem 0.7rem;
+  border-radius: 6px;
+}
+button:hover { border-color: var(--accent); }
+button.primary { background: var(--accent); border-color: var(--accent); color: #06121f; font-weight: 600; }
+button.danger { color: var(--danger); }
+button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+input, select, textarea {
+  font: inherit;
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.4rem 0.5rem;
+  width: 100%;
+}
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 1rem;
+}
+
+.muted { color: var(--muted); }
+.row { display: flex; gap: 0.5rem; align-items: center; }
+.stack { display: flex; flex-direction: column; gap: 0.6rem; }
+
+.badge {
+  display: inline-block;
+  padding: 0.1rem 0.5rem;
+  border-radius: 999px;
+  font-size: 0.78rem;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+}
+.badge.prio-high, .badge.prio-urgent { color: var(--warn); border-color: var(--warn); }
+.badge.prio-urgent { color: var(--danger); border-color: var(--danger); }
+
+.error {
+  color: var(--danger);
+  background: rgba(255, 92, 92, 0.08);
+  border: 1px solid rgba(255, 92, 92, 0.3);
+  border-radius: 6px;
+  padding: 0.4rem 0.6rem;
+}
