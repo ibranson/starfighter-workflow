@@ -1,9 +1,10 @@
-// Package repair owns the repair-request domain: persistence, the workflow
-// state machine (see states.go), and the immutable per-request event log.
+// Package repair owns the repair-request domain: persistence plus the workflow
+// state machine (see states.go).
 //
-// Every mutation that changes a request appends a row to request_events so the
-// history tab and audit trail are always complete. The HTTP layer is a thin
-// wrapper over this service.
+// This is a deliberately simple "current state" model — no event/audit log.
+// The request row (status, owner, timestamps) is the single source of truth,
+// and the state machine answers "what can I do next" for any authenticated
+// user at any time.
 package repair
 
 import (
@@ -11,7 +12,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"strconv"
 	"strings"
 	"time"
 
@@ -24,50 +24,49 @@ var (
 	ErrInvalidPriority = errors.New("repair: invalid priority")
 	ErrBadTransition   = errors.New("repair: illegal status transition")
 	ErrValidation      = errors.New("repair: missing required field")
+	// ErrClaimFailed means the request was no longer unclaimed when this
+	// caller tried to claim it — another user won the race. The caller is
+	// expected to surface this on screen.
+	ErrClaimFailed = errors.New("repair: request was already claimed")
+	// ErrNotOwnable means take-over was attempted on a request that isn't in
+	// an owned state (it's still unclaimed, or already closed).
+	ErrNotOwnable = errors.New("repair: request cannot be taken over in its current state")
+	// ErrUseClaim means a plain transition tried to do received -> in_repair,
+	// which must go through Claim so ownership is set atomically.
+	ErrUseClaim = errors.New("repair: take ownership via claim, not a plain transition")
 )
 
-// Priorities accepted by the API (mirrors the CHECK constraint in 0001_init).
 var validPriorities = map[string]bool{
 	"low": true, "normal": true, "high": true, "urgent": true,
 }
 
 type Request struct {
-	ID              int64      `json:"id"`
-	GameTitle       string     `json:"game_title"`
-	CabinetRef      string     `json:"cabinet_ref"`
-	ProblemSummary  string     `json:"problem_summary"`
-	ProblemDetail   string     `json:"problem_detail"`
-	ReporterName    string     `json:"reporter_name"`
-	ReporterContact string     `json:"reporter_contact"`
-	Status          Status     `json:"status"`
-	Priority        string     `json:"priority"`
-	AssignedTo      *int64     `json:"assigned_to,omitempty"`
-	CreatedBy       *int64     `json:"created_by,omitempty"`
-	CreatedAt       time.Time  `json:"created_at"`
-	UpdatedAt       time.Time  `json:"updated_at"`
-	ClosedAt        *time.Time `json:"closed_at,omitempty"`
+	ID             int64  `json:"id"`
+	MachineID      int64  `json:"machine_id"`
+	MachineName    string `json:"machine_name"` // joined from machines for display
+	ProblemSummary string `json:"problem_summary"`
+	ProblemDetail  string `json:"problem_detail"`
+	Status         Status `json:"status"`
+	Priority       string `json:"priority"`
+	// Owner. AssignedTo is NULL while 'received'. AssignedUsername is joined
+	// in for display so non-admin users (who can't list users) can still see
+	// who owns a request.
+	AssignedTo       *int64     `json:"assigned_to,omitempty"`
+	AssignedUsername *string    `json:"assigned_username,omitempty"`
+	CreatedBy        *int64     `json:"created_by,omitempty"`
+	CreatedAt        time.Time  `json:"created_at"`
+	UpdatedAt        time.Time  `json:"updated_at"`
+	ClosedAt         *time.Time `json:"closed_at,omitempty"`
 }
 
-type Event struct {
-	ID        int64     `json:"id"`
-	RequestID int64     `json:"request_id"`
-	ActorID   *int64    `json:"actor_id,omitempty"`
-	Kind      string    `json:"kind"`
-	FromValue *string   `json:"from_value,omitempty"`
-	ToValue   *string   `json:"to_value,omitempty"`
-	Note      string    `json:"note"`
-	CreatedAt time.Time `json:"created_at"`
-}
-
-// CreateInput carries the fields a caller may set when opening a request.
+// CreateInput carries the fields a caller may set when logging a request. The
+// machine is referenced by id — callers resolve the user-typed machine name to
+// an id via the machines registry (find-or-create) before calling Create.
 type CreateInput struct {
-	GameTitle       string
-	CabinetRef      string
-	ProblemSummary  string
-	ProblemDetail   string
-	ReporterName    string
-	ReporterContact string
-	Priority        string // optional; defaults to "normal"
+	MachineID      int64
+	ProblemSummary string
+	ProblemDetail  string
+	Priority       string // optional; defaults to "normal"
 }
 
 type Service struct {
@@ -76,12 +75,20 @@ type Service struct {
 
 func NewService(d *db.DB) *Service { return &Service{db: d} }
 
-// Create opens a new request in StatusReceived and logs the 'created' event.
-func (s *Service) Create(ctx context.Context, in CreateInput, actorID int64) (*Request, error) {
-	in.GameTitle = strings.TrimSpace(in.GameTitle)
+const selectCols = `
+	SELECT r.id, m.id, m.name, r.problem_summary, r.problem_detail,
+	       r.status, r.priority, r.assigned_to, u.username, r.created_by,
+	       r.created_at, r.updated_at, r.closed_at
+	FROM repair_requests r
+	JOIN machines m ON m.id = r.machine_id
+	LEFT JOIN users u ON u.id = r.assigned_to`
+
+// Create logs a new request in StatusReceived (unclaimed). MachineID must
+// already be resolved (find-or-create) by the caller.
+func (s *Service) Create(ctx context.Context, in CreateInput, createdBy int64) (*Request, error) {
 	in.ProblemSummary = strings.TrimSpace(in.ProblemSummary)
-	if in.GameTitle == "" || in.ProblemSummary == "" {
-		return nil, fmt.Errorf("%w: game_title and problem_summary are required", ErrValidation)
+	if in.MachineID <= 0 || in.ProblemSummary == "" {
+		return nil, fmt.Errorf("%w: machine and problem_summary are required", ErrValidation)
 	}
 	if in.Priority == "" {
 		in.Priority = "normal"
@@ -89,45 +96,27 @@ func (s *Service) Create(ctx context.Context, in CreateInput, actorID int64) (*R
 	if !validPriorities[in.Priority] {
 		return nil, ErrInvalidPriority
 	}
-
 	now := time.Now().Unix()
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	res, err := tx.ExecContext(ctx, `
+	res, err := s.db.ExecContext(ctx, `
 		INSERT INTO repair_requests
-			(game_title, cabinet_ref, problem_summary, problem_detail,
-			 reporter_name, reporter_contact, status, priority,
-			 created_by, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`,
-		in.GameTitle, strings.TrimSpace(in.CabinetRef), in.ProblemSummary,
-		strings.TrimSpace(in.ProblemDetail), strings.TrimSpace(in.ReporterName),
-		strings.TrimSpace(in.ReporterContact), string(StatusReceived), in.Priority,
-		actorID, now, now,
+			(machine_id, problem_summary, problem_detail,
+			 status, priority, created_by, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		in.MachineID, in.ProblemSummary, strings.TrimSpace(in.ProblemDetail),
+		string(StatusReceived), in.Priority, createdBy, now, now,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("insert request: %w", err)
 	}
 	id, _ := res.LastInsertId()
-
-	if err := appendEvent(ctx, tx, id, &actorID, "created", nil, ptr(string(StatusReceived)), ""); err != nil {
-		return nil, err
-	}
-	if err := tx.Commit(); err != nil {
-		return nil, err
-	}
 	return s.Get(ctx, id)
 }
 
 // ListFilter narrows the List query. Zero value lists everything.
 type ListFilter struct {
-	Status     string // exact status, or "" for any
-	AssignedTo *int64 // filter by assignee
-	OpenOnly   bool   // exclude terminal statuses
+	Status     string
+	AssignedTo *int64
+	OpenOnly   bool
 }
 
 // List returns requests newest-activity-first, subject to filter.
@@ -137,24 +126,21 @@ func (s *Service) List(ctx context.Context, f ListFilter) ([]Request, error) {
 		args  []any
 	)
 	if f.Status != "" {
-		where = append(where, "status = ?")
+		where = append(where, "r.status = ?")
 		args = append(args, f.Status)
 	}
 	if f.AssignedTo != nil {
-		where = append(where, "assigned_to = ?")
+		where = append(where, "r.assigned_to = ?")
 		args = append(args, *f.AssignedTo)
 	}
 	if f.OpenOnly {
-		where = append(where, "closed_at IS NULL")
+		where = append(where, "r.closed_at IS NULL")
 	}
-	q := `SELECT id, game_title, cabinet_ref, problem_summary, problem_detail,
-	             reporter_name, reporter_contact, status, priority, assigned_to,
-	             created_by, created_at, updated_at, closed_at
-	      FROM repair_requests`
+	q := selectCols
 	if len(where) > 0 {
 		q += " WHERE " + strings.Join(where, " AND ")
 	}
-	q += " ORDER BY updated_at DESC, id DESC"
+	q += " ORDER BY r.updated_at DESC, r.id DESC"
 
 	rows, err := s.db.QueryContext(ctx, q, args...)
 	if err != nil {
@@ -174,57 +160,64 @@ func (s *Service) List(ctx context.Context, f ListFilter) ([]Request, error) {
 
 // Get returns a single request by id.
 func (s *Service) Get(ctx context.Context, id int64) (*Request, error) {
-	row := s.db.QueryRowContext(ctx, `
-		SELECT id, game_title, cabinet_ref, problem_summary, problem_detail,
-		       reporter_name, reporter_contact, status, priority, assigned_to,
-		       created_by, created_at, updated_at, closed_at
-		FROM repair_requests WHERE id = ?`, id)
-	r, err := scanRequest(row)
+	r, err := scanRequest(s.db.QueryRowContext(ctx, selectCols+" WHERE r.id = ?", id))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
 	return r, err
 }
 
-// Events returns the full event log for a request, oldest first.
-func (s *Service) Events(ctx context.Context, id int64) ([]Event, error) {
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, request_id, actor_id, kind, from_value, to_value, note, created_at
-		FROM request_events WHERE request_id = ? ORDER BY id ASC`, id)
+// Claim performs the received -> in_repair move and sets the actor as owner,
+// atomically and with first-wins semantics: the UPDATE only matches a row
+// still in 'received', so exactly one concurrent caller succeeds. A caller
+// that gets ErrClaimFailed must report it (the request is already owned).
+func (s *Service) Claim(ctx context.Context, id, actor int64) (*Request, error) {
+	now := time.Now().Unix()
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE repair_requests SET status = ?, assigned_to = ?, updated_at = ?
+		 WHERE id = ? AND status = ?`,
+		string(StatusInRepair), actor, now, id, string(StatusReceived),
+	)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("claim: %w", err)
 	}
-	defer rows.Close()
-	out := []Event{}
-	for rows.Next() {
-		var (
-			e         Event
-			actorID   sql.NullInt64
-			fromVal   sql.NullString
-			toVal     sql.NullString
-			createdAt int64
-		)
-		if err := rows.Scan(&e.ID, &e.RequestID, &actorID, &e.Kind, &fromVal, &toVal, &e.Note, &createdAt); err != nil {
-			return nil, err
+	if n, _ := res.RowsAffected(); n == 0 {
+		// Distinguish "no such request" from "already claimed".
+		if _, err := s.Get(ctx, id); err != nil {
+			return nil, err // ErrNotFound
 		}
-		if actorID.Valid {
-			e.ActorID = &actorID.Int64
-		}
-		if fromVal.Valid {
-			e.FromValue = &fromVal.String
-		}
-		if toVal.Valid {
-			e.ToValue = &toVal.String
-		}
-		e.CreatedAt = time.Unix(createdAt, 0)
-		out = append(out, e)
+		return nil, ErrClaimFailed
 	}
-	return out, rows.Err()
+	return s.Get(ctx, id)
 }
 
-// Transition moves a request to a new status if the state machine permits it,
-// stamping closed_at when entering a terminal state and logging the change.
-func (s *Service) Transition(ctx context.Context, id int64, to Status, actorID int64, note string) (*Request, error) {
+// TakeOver pulls ownership of an already-owned request to the actor. Allowed
+// only while the request is in an owned, non-terminal state (in_repair or
+// awaiting_parts). Pull-only: a user makes themselves the owner; ownership is
+// never pushed to anyone else. No status change.
+func (s *Service) TakeOver(ctx context.Context, id, actor int64) (*Request, error) {
+	now := time.Now().Unix()
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE repair_requests SET assigned_to = ?, updated_at = ?
+		 WHERE id = ? AND status IN (?, ?)`,
+		actor, now, id, string(StatusInRepair), string(StatusAwaitingParts),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("take over: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		if _, err := s.Get(ctx, id); err != nil {
+			return nil, err // ErrNotFound
+		}
+		return nil, ErrNotOwnable
+	}
+	return s.Get(ctx, id)
+}
+
+// Transition moves a request along the state machine for every edge EXCEPT
+// the claim edge (received -> in_repair), which must go through Claim. Stamps
+// closed_at when entering a terminal state.
+func (s *Service) Transition(ctx context.Context, id int64, to Status) (*Request, error) {
 	if !validStatus(to) {
 		return nil, ErrInvalidStatus
 	}
@@ -232,144 +225,42 @@ func (s *Service) Transition(ctx context.Context, id int64, to Status, actorID i
 	if err != nil {
 		return nil, err
 	}
+	if cur.Status == StatusReceived && to == StatusInRepair {
+		return nil, ErrUseClaim
+	}
 	if !CanTransition(cur.Status, to) {
 		return nil, fmt.Errorf("%w: %s -> %s", ErrBadTransition, cur.Status, to)
 	}
-
 	now := time.Now().Unix()
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = tx.Rollback() }()
-
 	if IsTerminal(to) {
-		_, err = tx.ExecContext(ctx,
+		_, err = s.db.ExecContext(ctx,
 			`UPDATE repair_requests SET status = ?, updated_at = ?, closed_at = ? WHERE id = ?`,
 			string(to), now, now, id)
 	} else {
-		// Re-opening from a terminal state isn't reachable (terminals have
-		// no outgoing transitions), so clearing closed_at here is only for
-		// the on_hold/active paths where it's already NULL — harmless.
-		_, err = tx.ExecContext(ctx,
+		_, err = s.db.ExecContext(ctx,
 			`UPDATE repair_requests SET status = ?, updated_at = ?, closed_at = NULL WHERE id = ?`,
 			string(to), now, id)
 	}
 	if err != nil {
-		return nil, fmt.Errorf("update status: %w", err)
-	}
-	if err := appendEvent(ctx, tx, id, &actorID, "status_change", ptr(string(cur.Status)), ptr(string(to)), strings.TrimSpace(note)); err != nil {
-		return nil, err
-	}
-	if err := tx.Commit(); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("transition: %w", err)
 	}
 	return s.Get(ctx, id)
 }
 
-// Assign sets (or clears, when assignee is nil) the assignee and logs it.
-func (s *Service) Assign(ctx context.Context, id int64, assignee *int64, actorID int64, note string) (*Request, error) {
-	cur, err := s.Get(ctx, id)
-	if err != nil {
-		return nil, err
-	}
-	now := time.Now().Unix()
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	if _, err := tx.ExecContext(ctx,
-		`UPDATE repair_requests SET assigned_to = ?, updated_at = ? WHERE id = ?`,
-		assignee, now, id); err != nil {
-		return nil, fmt.Errorf("update assignee: %w", err)
-	}
-	from := nullableID(cur.AssignedTo)
-	to := nullableID(assignee)
-	if err := appendEvent(ctx, tx, id, &actorID, "assignment", from, to, strings.TrimSpace(note)); err != nil {
-		return nil, err
-	}
-	if err := tx.Commit(); err != nil {
-		return nil, err
-	}
-	return s.Get(ctx, id)
-}
-
-// SetPriority changes the priority and logs it.
-func (s *Service) SetPriority(ctx context.Context, id int64, priority string, actorID int64, note string) (*Request, error) {
+// SetPriority changes the triage priority. Plain field update, no transition.
+func (s *Service) SetPriority(ctx context.Context, id int64, priority string) (*Request, error) {
 	if !validPriorities[priority] {
 		return nil, ErrInvalidPriority
-	}
-	cur, err := s.Get(ctx, id)
-	if err != nil {
-		return nil, err
-	}
-	now := time.Now().Unix()
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	if _, err := tx.ExecContext(ctx,
-		`UPDATE repair_requests SET priority = ?, updated_at = ? WHERE id = ?`,
-		priority, now, id); err != nil {
-		return nil, fmt.Errorf("update priority: %w", err)
-	}
-	if err := appendEvent(ctx, tx, id, &actorID, "priority_change", ptr(cur.Priority), ptr(priority), strings.TrimSpace(note)); err != nil {
-		return nil, err
-	}
-	if err := tx.Commit(); err != nil {
-		return nil, err
-	}
-	return s.Get(ctx, id)
-}
-
-// AddNote appends a free-text note to the request's history without otherwise
-// changing it (touches updated_at so it sorts to the top).
-func (s *Service) AddNote(ctx context.Context, id int64, actorID int64, note string) (*Event, error) {
-	note = strings.TrimSpace(note)
-	if note == "" {
-		return nil, fmt.Errorf("%w: note is empty", ErrValidation)
 	}
 	if _, err := s.Get(ctx, id); err != nil {
 		return nil, err
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return nil, err
+	if _, err := s.db.ExecContext(ctx,
+		`UPDATE repair_requests SET priority = ?, updated_at = ? WHERE id = ?`,
+		priority, time.Now().Unix(), id); err != nil {
+		return nil, fmt.Errorf("set priority: %w", err)
 	}
-	defer func() { _ = tx.Rollback() }()
-
-	if _, err := tx.ExecContext(ctx,
-		`UPDATE repair_requests SET updated_at = ? WHERE id = ?`, time.Now().Unix(), id); err != nil {
-		return nil, err
-	}
-	if err := appendEvent(ctx, tx, id, &actorID, "note", nil, nil, note); err != nil {
-		return nil, err
-	}
-	if err := tx.Commit(); err != nil {
-		return nil, err
-	}
-	evs, err := s.Events(ctx, id)
-	if err != nil || len(evs) == 0 {
-		return nil, err
-	}
-	return &evs[len(evs)-1], nil
-}
-
-// appendEvent inserts one immutable audit row inside the caller's tx.
-func appendEvent(ctx context.Context, tx *sql.Tx, requestID int64, actorID *int64, kind string, from, to *string, note string) error {
-	_, err := tx.ExecContext(ctx, `
-		INSERT INTO request_events
-			(request_id, actor_id, kind, from_value, to_value, note, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		requestID, actorID, kind, from, to, note, time.Now().Unix())
-	if err != nil {
-		return fmt.Errorf("append event: %w", err)
-	}
-	return nil
+	return s.Get(ctx, id)
 }
 
 func scanRequest(sc interface{ Scan(...any) error }) (*Request, error) {
@@ -377,21 +268,25 @@ func scanRequest(sc interface{ Scan(...any) error }) (*Request, error) {
 		r          Request
 		status     string
 		assignedTo sql.NullInt64
+		assignedU  sql.NullString
 		createdBy  sql.NullInt64
 		createdAt  int64
 		updatedAt  int64
 		closedAt   sql.NullInt64
 	)
 	if err := sc.Scan(
-		&r.ID, &r.GameTitle, &r.CabinetRef, &r.ProblemSummary, &r.ProblemDetail,
-		&r.ReporterName, &r.ReporterContact, &status, &r.Priority, &assignedTo,
-		&createdBy, &createdAt, &updatedAt, &closedAt,
+		&r.ID, &r.MachineID, &r.MachineName, &r.ProblemSummary, &r.ProblemDetail,
+		&status, &r.Priority, &assignedTo, &assignedU, &createdBy,
+		&createdAt, &updatedAt, &closedAt,
 	); err != nil {
 		return nil, err
 	}
 	r.Status = Status(status)
 	if assignedTo.Valid {
 		r.AssignedTo = &assignedTo.Int64
+	}
+	if assignedU.Valid {
+		r.AssignedUsername = &assignedU.String
 	}
 	if createdBy.Valid {
 		r.CreatedBy = &createdBy.Int64
@@ -403,14 +298,4 @@ func scanRequest(sc interface{ Scan(...any) error }) (*Request, error) {
 		r.ClosedAt = &t
 	}
 	return &r, nil
-}
-
-func ptr(s string) *string { return &s }
-
-func nullableID(id *int64) *string {
-	if id == nil {
-		return nil
-	}
-	s := strconv.FormatInt(*id, 10)
-	return &s
 }

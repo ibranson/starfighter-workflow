@@ -13,37 +13,29 @@ export interface User {
   last_login_at?: string;
 }
 
-export type Status =
-  | 'received' | 'diagnosing' | 'awaiting_parts' | 'in_repair'
-  | 'testing' | 'ready_for_pickup' | 'on_hold' | 'completed' | 'cancelled';
+export type Status = 'received' | 'in_repair' | 'awaiting_parts' | 'completed' | 'cancelled';
 
 export type Priority = 'low' | 'normal' | 'high' | 'urgent';
 
 export interface RepairRequest {
   id: number;
-  game_title: string;
-  cabinet_ref: string;
+  machine_id: number;
+  machine_name: string;
   problem_summary: string;
   problem_detail: string;
-  reporter_name: string;
-  reporter_contact: string;
   status: Status;
   priority: Priority;
   assigned_to?: number;
+  assigned_username?: string;
   created_by?: number;
   created_at: string;
   updated_at: string;
   closed_at?: string;
 }
 
-export interface RequestEvent {
+export interface Machine {
   id: number;
-  request_id: number;
-  actor_id?: number;
-  kind: string;
-  from_value?: string;
-  to_value?: string;
-  note: string;
+  name: string;
   created_at: string;
 }
 
@@ -99,6 +91,12 @@ export const api = {
   workflowMeta: () =>
     req<{ statuses: StatusMeta[]; priorities: Priority[] }>('GET', '/api/v1/workflow/meta'),
 
+  // Machines accumulator — type-ahead for the reporting form.
+  searchMachines: (q = '') => {
+    const qs = q ? `?q=${encodeURIComponent(q)}` : '';
+    return req<{ machines: Machine[] }>('GET', `/api/v1/machines${qs}`);
+  },
+
   // Repair requests.
   listRequests: (params: { status?: string; open?: boolean } = {}) => {
     const qs = new URLSearchParams();
@@ -107,18 +105,21 @@ export const api = {
     const q = qs.toString();
     return req<{ requests: RepairRequest[] }>('GET', '/api/v1/requests' + (q ? `?${q}` : ''));
   },
-  createRequest: (input: Partial<RepairRequest>) =>
+  createRequest: (input: { machine: string; problem_summary: string; problem_detail?: string; priority?: Priority }) =>
     req<{ request: RepairRequest }>('POST', '/api/v1/requests', input),
   getRequest: (id: number) =>
-    req<{ request: RepairRequest; events: RequestEvent[] }>('GET', `/api/v1/requests/${id}`),
-  transition: (id: number, status: Status, note = '') =>
-    req<{ request: RepairRequest }>('POST', `/api/v1/requests/${id}/transition`, { status, note }),
-  assign: (id: number, assigned_to: number | null, note = '') =>
-    req<{ request: RepairRequest }>('POST', `/api/v1/requests/${id}/assign`, { assigned_to, note }),
-  setPriority: (id: number, priority: Priority, note = '') =>
-    req<{ request: RepairRequest }>('POST', `/api/v1/requests/${id}/priority`, { priority, note }),
-  addNote: (id: number, note: string) =>
-    req<{ event: RequestEvent }>('POST', `/api/v1/requests/${id}/notes`, { note }),
+    req<{ request: RepairRequest }>('GET', `/api/v1/requests/${id}`),
+  // Claim = received -> in_repair, taking ownership. Throws ApiError(409) if
+  // someone else already claimed it (first-wins) — callers must report that.
+  claim: (id: number) =>
+    req<{ request: RepairRequest }>('POST', `/api/v1/requests/${id}/claim`),
+  // Take ownership of an already-owned request (pull-only).
+  takeOver: (id: number) =>
+    req<{ request: RepairRequest }>('POST', `/api/v1/requests/${id}/take-over`),
+  transition: (id: number, status: Status) =>
+    req<{ request: RepairRequest }>('POST', `/api/v1/requests/${id}/transition`, { status }),
+  setPriority: (id: number, priority: Priority) =>
+    req<{ request: RepairRequest }>('POST', `/api/v1/requests/${id}/priority`, { priority }),
 
   // User management (admin only).
   listUsers: () => req<{ users: User[] }>('GET', '/api/v1/users'),

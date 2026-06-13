@@ -26,6 +26,7 @@ import (
 	"starfighter-workflow/internal/config"
 	"starfighter-workflow/internal/db"
 	"starfighter-workflow/internal/httpapi"
+	"starfighter-workflow/internal/machines"
 	"starfighter-workflow/internal/nodestate"
 	"starfighter-workflow/internal/repair"
 	"starfighter-workflow/internal/version"
@@ -62,6 +63,7 @@ func main() {
 	defer d.Close()
 
 	authSvc := auth.NewService(d)
+	machinesSvc := machines.NewService(d)
 	repairSvc := repair.NewService(d)
 	nodeStore := nodestate.New(d)
 
@@ -103,7 +105,7 @@ func main() {
 		}
 	}()
 
-	srv := httpapi.NewServer(cfg, *configPath, logger, d, authSvc, repairSvc)
+	srv := httpapi.NewServer(cfg, *configPath, logger, d, authSvc, machinesSvc, repairSvc)
 
 	httpSrv := &http.Server{
 		Addr:              cfg.HTTP.Addr,

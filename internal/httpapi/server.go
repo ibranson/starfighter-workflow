@@ -17,6 +17,7 @@ import (
 	"starfighter-workflow/internal/auth"
 	"starfighter-workflow/internal/config"
 	"starfighter-workflow/internal/db"
+	"starfighter-workflow/internal/machines"
 	"starfighter-workflow/internal/repair"
 	"starfighter-workflow/internal/version"
 	"starfighter-workflow/internal/web"
@@ -28,13 +29,14 @@ type Server struct {
 	logger     *slog.Logger
 	db         *db.DB
 	auth       *auth.Service
+	machines   *machines.Service
 	repair     *repair.Service
 	mux        *http.ServeMux
 }
 
 func NewServer(
 	cfg config.Config, configPath string, logger *slog.Logger, d *db.DB,
-	authSvc *auth.Service, repairSvc *repair.Service,
+	authSvc *auth.Service, machinesSvc *machines.Service, repairSvc *repair.Service,
 ) *Server {
 	s := &Server{
 		cfg:        cfg,
@@ -42,6 +44,7 @@ func NewServer(
 		logger:     logger,
 		db:         d,
 		auth:       authSvc,
+		machines:   machinesSvc,
 		repair:     repairSvc,
 		mux:        http.NewServeMux(),
 	}
@@ -76,14 +79,21 @@ func (s *Server) routes() {
 	// Workflow metadata (state-machine catalog for the SPA).
 	s.mux.HandleFunc("GET /api/v1/workflow/meta", s.requireAuth(s.handleWorkflowMeta))
 
+	// Machines accumulator — type-ahead search for the reporting form. New
+	// machines are created implicitly via find-or-create when a request is
+	// logged (see handleCreateRequest), so there's no explicit create route.
+	s.mux.HandleFunc("GET /api/v1/machines", s.requireAuth(s.handleSearchMachines))
+
 	// Repair requests — full surface open to any authenticated user.
 	s.mux.HandleFunc("GET /api/v1/requests", s.requireAuth(s.handleListRequests))
 	s.mux.HandleFunc("POST /api/v1/requests", s.requireSameOrigin(s.requireAuth(s.handleCreateRequest)))
 	s.mux.HandleFunc("GET /api/v1/requests/{id}", s.requireAuth(s.handleGetRequest))
+	// Claim = received -> in_repair + take ownership (first-wins). Take-over
+	// pulls ownership of an already-owned request to the caller (pull-only).
+	s.mux.HandleFunc("POST /api/v1/requests/{id}/claim", s.requireSameOrigin(s.requireAuth(s.handleClaimRequest)))
+	s.mux.HandleFunc("POST /api/v1/requests/{id}/take-over", s.requireSameOrigin(s.requireAuth(s.handleTakeOverRequest)))
 	s.mux.HandleFunc("POST /api/v1/requests/{id}/transition", s.requireSameOrigin(s.requireAuth(s.handleTransitionRequest)))
-	s.mux.HandleFunc("POST /api/v1/requests/{id}/assign", s.requireSameOrigin(s.requireAuth(s.handleAssignRequest)))
 	s.mux.HandleFunc("POST /api/v1/requests/{id}/priority", s.requireSameOrigin(s.requireAuth(s.handleSetPriority)))
-	s.mux.HandleFunc("POST /api/v1/requests/{id}/notes", s.requireSameOrigin(s.requireAuth(s.handleAddNote)))
 
 	// SPA fallback for everything else; SvelteKit handles client-side routing.
 	s.mux.Handle("/", web.Handler())
